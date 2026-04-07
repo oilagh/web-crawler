@@ -1,0 +1,11 @@
+For this project, I built a web crawler that logs into Fakebook and traverses the site to find five hidden secret flags. The crawler communicates directly with the server using HTTP/1.1 over TLS, without using any high-level HTTP libraries.
+
+I started by setting up a TCP connection wrapped in TLS using Python’s socket and ssl modules. All HTTP requests were manually constructed, including both GET and POST. To log in, the crawler first sends a GET request to the login page, parses the HTML to extract the CSRF token, and then sends a POST request with the username, password, and token. After a successful login, it stores the session cookie and includes it in all future requests to maintain authentication.
+
+For crawling, I used a queue-based approach similar to BFS. I kept track of URLs to visit using a frontier, along with visited and seen sets to avoid revisiting pages or adding duplicates. The crawler starts at /fakebook/, extracts links from each page, and continues exploring until all five flags are found. Flags are identified using a regular expression that matches the required 64-character format.
+
+The crawler also handles several HTTP behaviors, including redirects, cookies, and different status codes. It follows redirects using the Location header, skips invalid pages like 403 and 404, and retries requests when encountering 503 errors. It also supports chunked transfer encoding by reconstructing responses when needed.
+
+One of the main challenges was getting the login process to work correctly, especially handling CSRF tokens and cookies. If either part was incorrect, the crawler would repeatedly get redirected back to the login page. I also initially ran into timeouts when testing in Codespaces, which turned out to be a network restriction issue, so I switched to running the crawler locally. Another issue was inefficiency from duplicate URLs, which I fixed by tracking seen links before adding them to the queue.
+
+I tested the crawler incrementally by first verifying basic HTTP requests, then confirming successful login, and finally adding crawling and flag extraction. In the end, the program correctly prints exactly five flags to standard output as required.
