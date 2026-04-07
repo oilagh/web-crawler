@@ -1,10 +1,40 @@
 #!/usr/bin/env python3
 
 import argparse
+import re
 import socket
+import ssl
+import sys
+import time
+from collections import deque
+from html.parser import HTMLParser
+from urllib.parse import urlparse, urljoin, urlencode
 
 DEFAULT_SERVER = "fakebook.khoury.northeastern.edu"
 DEFAULT_PORT = 443
+
+LOGIN_PATH = "/accounts/login/?next=/fakebook/"
+START_PATH = "/fakebook/"
+
+
+class LinkAndTokenParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links = []
+        self.csrf_token = None
+
+    def handle_starttag(self, tag, attrs):
+        attr_dict = dict(attrs)
+
+        if tag == "a" and "href" in attr_dict:
+            self.links.append(attr_dict["href"])
+
+        if tag == "input":
+            name = attr_dict.get("name", "")
+            value = attr_dict.get("value", "")
+            if name == "csrfmiddlewaretoken":
+                self.csrf_token = value
+
 
 class Crawler:
     def __init__(self, args):
@@ -13,28 +43,324 @@ class Crawler:
         self.username = args.username
         self.password = args.password
 
+        self.cookies = {}
+        self.flags = []
+        self.flag_set = set()
+        self.visited = set()
+        self.frontier = deque()
+
     def run(self):
-        request = "GET / HTTP/1.0\r\n\r\n"
+        self.login()
 
-        print("Request to %s:%d" % (self.server, self.port))
-        print(request)
-        mysocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        mysocket.connect((self.server, self.port))
-        mysocket.send(request.encode('ascii'))
+        self.frontier.append(START_PATH)
 
-        data = mysocket.recv(1000)
-        # if length of data is zero, the server has closed the connection
-        if len(data) == 0:
-            print("Response:\nSocket closed by %s" % self.server)
+        while self.frontier and len(self.flags) < 5:
+            current = self.frontier.popleft()
+            normalized = self.normalize_url(current)
+
+            if not normalized:
+                continue
+
+            if normalized in self.visited:
+                continue
+
+            self.visited.add(normalized)
+
+            status, headers, body = self.get(normalized)
+
+            if status == 200:
+                self.extract_flags(body)
+                if len(self.flags) >= 5:
+                    break
+
+                for link in self.extract_links(body, normalized):
+                    if link not in self.visited:
+                        self.frontier.append(link)
+
+        for flag in self.flags[:5]:
+            print(flag)
+
+    def create_tls_socket(self):
+        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw_sock.settimeout(30)
+
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+
+        tls_sock = context.wrap_socket(raw_sock, server_hostname=self.server)
+        tls_sock.connect((self.server, self.port))
+        return tls_sock
+
+    def send_http_request(self, method, path, body=None, extra_headers=None, retry_count=0):
+        if extra_headers is None:
+            extra_headers = {}
+
+        if body is None:
+            body_bytes = b""
         else:
-            print("Response:\n%s" % data.decode('ascii'))
+            if isinstance(body, str):
+                body_bytes = body.encode("utf-8")
+            else:
+                body_bytes = body
+
+        request_lines = [
+            f"{method} {path} HTTP/1.1",
+            f"Host: {self.server}",
+            "Connection: close",
+            "User-Agent: project5-crawler",
+            "Accept: text/html",
+        ]
+
+        cookie_header = self.build_cookie_header()
+        if cookie_header:
+            request_lines.append(f"Cookie: {cookie_header}")
+
+        for key, value in extra_headers.items():
+            request_lines.append(f"{key}: {value}")
+
+        if method == "POST":
+            request_lines.append(f"Content-Length: {len(body_bytes)}")
+
+        request_lines.append("")
+        request_lines.append("")
+
+        request_data = "\r\n".join(request_lines).encode("utf-8") + body_bytes
+
+        sock = self.create_tls_socket()
+        sock.sendall(request_data)
+
+        raw_response = self.recv_all(sock)
+        sock.close()
+
+        status_code, headers, response_body = self.parse_response(raw_response)
+        self.store_cookies(headers)
+
+        if status_code == 503:
+            if retry_count < 10:
+                time.sleep(0.5)
+                return self.send_http_request(method, path, body, extra_headers, retry_count + 1)
+            raise RuntimeError(f"Too many retries for 503 on {path}")
+
+        if status_code in (301, 302, 303, 307, 308):
+            location = headers.get("location")
+            if not location:
+                return status_code, headers, response_body
+
+            redirected_path = self.normalize_url(location)
+            if redirected_path is None:
+                return status_code, headers, response_body
+
+            if status_code == 303:
+                return self.send_http_request("GET", redirected_path)
+            if status_code in (301, 302) and method == "POST":
+                return self.send_http_request("GET", redirected_path)
+
+            return self.send_http_request(method, redirected_path, body, extra_headers, retry_count)
+
+        return status_code, headers, response_body
+
+    def recv_all(self, sock):
+        chunks = []
+        while True:
+            try:
+                data = sock.recv(4096)
+            except socket.timeout:
+                break
+
+            if not data:
+                break
+            chunks.append(data)
+        return b"".join(chunks)
+
+    def parse_response(self, raw_response):
+        header_end = raw_response.find(b"\r\n\r\n")
+        if header_end == -1:
+            raise RuntimeError("Malformed HTTP response: missing header separator")
+
+        header_bytes = raw_response[:header_end]
+        body_bytes = raw_response[header_end + 4:]
+
+        header_text = header_bytes.decode("iso-8859-1")
+        header_lines = header_text.split("\r\n")
+
+        status_line = header_lines[0]
+        match = re.match(r"HTTP/\d\.\d\s+(\d+)", status_line)
+        if not match:
+            raise RuntimeError(f"Malformed status line: {status_line}")
+        status_code = int(match.group(1))
+
+        headers = {}
+        set_cookie_values = []
+
+        for line in header_lines[1:]:
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            key = key.strip().lower()
+            value = value.strip()
+
+            if key == "set-cookie":
+                set_cookie_values.append(value)
+            else:
+                if key in headers:
+                    headers[key] = headers[key] + ", " + value
+                else:
+                    headers[key] = value
+
+        if set_cookie_values:
+            headers["set-cookie-list"] = set_cookie_values
+
+        if headers.get("transfer-encoding", "").lower() == "chunked":
+            body_bytes = self.decode_chunked(body_bytes)
+        else:
+            if "content-length" in headers:
+                expected = int(headers["content-length"])
+                body_bytes = body_bytes[:expected]
+
+        body = body_bytes.decode("utf-8", errors="replace")
+        return status_code, headers, body
+
+    def decode_chunked(self, body_bytes):
+        decoded = b""
+        idx = 0
+
+        while True:
+            line_end = body_bytes.find(b"\r\n", idx)
+            if line_end == -1:
+                break
+
+            chunk_size_line = body_bytes[idx:line_end].decode("ascii").strip()
+            chunk_size_str = chunk_size_line.split(";", 1)[0]
+
+            try:
+                chunk_size = int(chunk_size_str, 16)
+            except ValueError:
+                raise RuntimeError(f"Invalid chunk size: {chunk_size_line}")
+
+            idx = line_end + 2
+
+            if chunk_size == 0:
+                break
+
+            decoded += body_bytes[idx:idx + chunk_size]
+            idx += chunk_size + 2
+
+        return decoded
+
+    def build_cookie_header(self):
+        if not self.cookies:
+            return ""
+        return "; ".join(f"{k}={v}" for k, v in self.cookies.items())
+
+    def store_cookies(self, headers):
+        for cookie_line in headers.get("set-cookie-list", []):
+            pair = cookie_line.split(";", 1)[0]
+            if "=" in pair:
+                name, value = pair.split("=", 1)
+                self.cookies[name.strip()] = value.strip()
+
+    def get(self, path):
+        return self.send_http_request("GET", path)
+
+    def post(self, path, form_data, extra_headers=None):
+        if extra_headers is None:
+            extra_headers = {}
+        body = urlencode(form_data)
+        extra_headers["Content-Type"] = "application/x-www-form-urlencoded"
+        extra_headers["Referer"] = f"https://{self.server}:{self.port}{path}"
+        return self.send_http_request("POST", path, body=body, extra_headers=extra_headers)
+
+    def login(self):
+        status, headers, body = self.get(LOGIN_PATH)
+        if status != 200:
+            raise RuntimeError(f"Failed to load login page: HTTP {status}")
+
+        parser = LinkAndTokenParser()
+        parser.feed(body)
+
+        csrf_token = parser.csrf_token
+        if not csrf_token:
+            raise RuntimeError("Could not find CSRF token on login page")
+
+        form_data = {
+            "username": self.username,
+            "password": self.password,
+            "csrfmiddlewaretoken": csrf_token,
+            "next": "/fakebook/",
+        }
+
+        extra_headers = {
+            "Referer": f"https://{self.server}:{self.port}{LOGIN_PATH}"
+        }
+
+        status, headers, body = self.post(LOGIN_PATH, form_data, extra_headers)
+
+        if status != 200:
+            raise RuntimeError(f"Login failed: HTTP {status}")
+
+        if "sessionid" not in self.cookies:
+            raise RuntimeError("Login appears to have failed: no sessionid cookie found")
+
+    def normalize_url(self, url):
+        if not url:
+            return None
+
+        absolute = urljoin(f"https://{self.server}:{self.port}/", url)
+        parsed = urlparse(absolute)
+
+        if parsed.scheme != "https":
+            return None
+
+        if parsed.hostname != self.server:
+            return None
+
+        port = parsed.port
+        if port is not None and port != self.port:
+            return None
+
+        path = parsed.path or "/"
+        if parsed.query:
+            path = path + "?" + parsed.query
+
+        if not path.startswith("/fakebook/") and not path.startswith("/accounts/"):
+            return None
+
+        return path
+
+    def extract_links(self, html, base_path):
+        parser = LinkAndTokenParser()
+        parser.feed(html)
+
+        valid_links = []
+        for link in parser.links:
+            normalized = self.normalize_url(urljoin(base_path, link))
+            if normalized and normalized.startswith("/fakebook/"):
+                valid_links.append(normalized)
+
+        return valid_links
+
+    def extract_flags(self, html):
+        matches = re.findall(r"FLAG:\s*([A-Za-z0-9]{64})", html)
+        for flag_body in matches:
+            full_flag = f"FLAG: {flag_body}"
+            if full_flag not in self.flag_set:
+                self.flag_set.add(full_flag)
+                self.flags.append(full_flag)
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='crawl Fakebook')
-    parser.add_argument('-s', dest="server", type=str, default=DEFAULT_SERVER, help="The server to crawl")
-    parser.add_argument('-p', dest="port", type=int, default=DEFAULT_PORT, help="The port to use")
-    parser.add_argument('username', type=str, help="The username to use")
-    parser.add_argument('password', type=str, help="The password to use")
+    parser = argparse.ArgumentParser(description="crawl Fakebook")
+    parser.add_argument("-s", dest="server", type=str, default=DEFAULT_SERVER, help="The server to crawl")
+    parser.add_argument("-p", dest="port", type=int, default=DEFAULT_PORT, help="The port to use")
+    parser.add_argument("username", type=str, help="The username to use")
+    parser.add_argument("password", type=str, help="The password to use")
     args = parser.parse_args()
-    sender = Crawler(args)
-    sender.run()
+
+    crawler = Crawler(args)
+
+    try:
+        crawler.run()
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
