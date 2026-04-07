@@ -1,1 +1,2 @@
 all:
+	chmod +x crawler
