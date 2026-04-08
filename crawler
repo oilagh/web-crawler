@@ -66,6 +66,8 @@ class Crawler:
 
             self.visited.add(normalized)
 
+            print(f"[{len(self.visited)}] Visiting: {normalized} | frontier: {len(self.frontier)} | flags: {len(self.flags)}/5", file=sys.stderr)
+
             status, headers, body = self.get(normalized)
 
             if status == 200:
@@ -343,7 +345,7 @@ class Crawler:
     def extract_flags(self, html):
         matches = re.findall(r"FLAG:\s*([A-Za-z0-9]{64})", html)
         for flag_body in matches:
-            full_flag = f"FLAG: {flag_body}"
+            full_flag = f"{flag_body}"
             if full_flag not in self.flag_set:
                 self.flag_set.add(full_flag)
                 self.flags.append(full_flag)
